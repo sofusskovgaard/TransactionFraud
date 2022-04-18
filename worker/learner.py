@@ -5,12 +5,6 @@ import pandas as pd
 import numpy as np
 import tensorflow as tf
 
-def get_data(file_path,target='isfraud'):
-  d = pd.read_csv(file_path)
-  d['target'] = np.where(d[target]==1, 1, 0)
-  d = d.drop(columns=[target])
-  return d
-
 def split_data(data):
   train, val, test = np.split(data.sample(frac=1), [int(0.8*len(data)), int(0.9*len(data))])
   print(len(train), 'training examples')
@@ -18,15 +12,13 @@ def split_data(data):
   print(len(test), 'test examples')
   return {'train':train,'val':val,'test':test}
 
-def df_to_dataset(dataframe, shuffle=True, batch_size=32, should_batch=True):
+def df_to_dataset(dataframe, shuffle=True, batch_size=128, should_batch=True):
   df = dataframe.copy()
   labels = df.pop('target')
   df = {key: value[:,tf.newaxis] for key, value in dataframe.items()}
   ds = tf.data.Dataset.from_tensor_slices((dict(df), labels))
-  if shuffle:
-    ds = ds.shuffle(buffer_size=len(dataframe))
-  if should_batch:
-    ds = ds.batch(batch_size)
+  ds = ds.shuffle(buffer_size=len(dataframe))
+  ds = ds.batch(batch_size)
   ds = ds.prefetch(batch_size)
   return ds
 
@@ -74,7 +66,7 @@ def preprocess_data(training_dataset):
   encoded_features = []
 
   # Numerical features.
-  for header in ['step', 'hourofday', 'amount', 'oldbaldest', 'newbaldest', 'errbaldest', 'oldbalorg', 'newbalorg', 'errdbalorg']:
+  for header in ['hourOfDay', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'errbalanceOrig', 'errbalanceDest']:
     print(f'processing {header} feature')
     numeric_col = tf.keras.Input(shape=(1,), name=header)
     normalization_layer = get_normalization_layer(header, training_dataset)
@@ -109,7 +101,7 @@ def create_model(all_inputs, encoded_features):
   return model
 
 print('reading data')
-raw_data = get_data('./formatted.fraud.mini.csv')
+raw_data = pd.read_csv('./data/formatted.fraud.csv')
 print('splitting data')
 data = split_data(raw_data)
 print('creating datasets')

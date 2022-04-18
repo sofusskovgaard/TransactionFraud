@@ -1,0 +1,17 @@
+version: '3.4'
+
+services:
+  transactionfraud:
+    image: transactionfraud
+    build:
+      context: ./worker
+      dockerfile: ./Dockerfile
+    volumes:
+      - ./worker/models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
