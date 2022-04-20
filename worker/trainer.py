@@ -2,25 +2,39 @@ import time
 import pandas as pd
 import numpy as np
 import tensorflow as tf
+from tensorflow import keras
+import yaml
+import os
 
 class Trainer:
-  def __init__(self, path):
-    self.path = path
+  def __init__(self, input, output):
+    self.input = input
+    self.output = output
+    self.raw_data = pd.read_csv(input)
 
-  def __create_dataset(self, dataframe: pd.DataFrame, batch_size=128):
-    df = dataframe.copy()
-    print(df)
+  def __split(self):
+    train, val, test = np.split(self.raw_data.sample(frac=1), [int(0.8*len(self.raw_data)), int(0.9*len(self.raw_data))])
+    self.split_data = {'train':train,'val':val,'test':test}
+
+  def __create_dataset(self, df: pd.DataFrame, batch_size=128):
+    df = df.copy()
     labels = df.pop('target')
-    df = {key: value[:,tf.newaxis] for key, value in dataframe.items()}
+    df = {key: value.to_numpy()[:,tf.newaxis] for key, value in df.items()}
     ds = tf.data.Dataset.from_tensor_slices((dict(df), labels))
-    ds = ds.shuffle(buffer_size=len(dataframe))
+    ds = ds.shuffle(buffer_size=len(df))
     ds = ds.batch(batch_size)
     ds = ds.prefetch(batch_size)
     return ds
 
-  def __normalization_layer(self, name, dataset):
+  def __create_datasets(self):
+    train = self.__create_dataset(self.split_data['train'])
+    val = self.__create_dataset(self.split_data['val'])
+    test = self.__create_dataset(self.split_data['test'])
+    self.datasets = {'train':train,'val':val,'test':test}
+
+  def __create_numeric_layer(self, name, dataset, configs: dict):
     # Create a Normalization layer for the feature.
-    normalizer = tf.keras.layers.Normalization(axis=None)
+    normalizer = keras.layers.Normalization(axis=None)
 
     # Prepare a Dataset that only yields the feature.
     feature_ds = dataset.map(lambda x, y: x[name], num_parallel_calls=tf.data.AUTOTUNE)
@@ -28,15 +42,17 @@ class Trainer:
     # Learn the statistics of the data.
     normalizer.adapt(feature_ds)
 
+    configs.update({ name: {'mean':float(normalizer.mean[0][0]),'variance':float(normalizer.variance[0][0])} })
+
     return normalizer
 
-  def __category_encoding_layer(self, name, dataset, dtype, max_tokens=None):
+  def __create_string_layer(self, name, dataset, dtype, configs: dict, max_tokens=None):
     # Create a layer that turns strings into integer indices.
     if dtype == 'string':
-      index = tf.keras.layers.StringLookup(max_tokens=max_tokens)
+      index = keras.layers.StringLookup(max_tokens=max_tokens)
     # Otherwise, create a layer that turns integer values into integer indices.
     else:
-      index = tf.keras.layers.IntegerLookup(max_tokens=max_tokens)
+      index = keras.layers.IntegerLookup(max_tokens=max_tokens)
 
     # Prepare a `tf.data.Dataset` that only yields the feature.
     feature_ds = dataset.map(lambda x, y: x[name], num_parallel_calls=4)
@@ -44,97 +60,100 @@ class Trainer:
     # Learn the set of possible values and assign them a fixed integer index.
     index.adapt(feature_ds)
 
+    configs.update({ name: {'vocab':list(map(lambda x: str(x), index.get_vocabulary()))} })
+
     # Encode the integer indices.
-    encoder = tf.keras.layers.CategoryEncoding(num_tokens=index.vocabulary_size())
+    encoder = keras.layers.CategoryEncoding(num_tokens=index.vocabulary_size())
 
     # Apply multi-hot encoding to the indices. The lambda function captures the
     # layer, so you can use them, or include them in the Keras Functional model later.
     return lambda feature: encoder(index(feature))
 
-  def load_data(self):
-    self.raw_data = pd.read_csv(self.path)
+  def __preprocess_data(self):
+    all_inputs = []
+    encoded_features = []
 
-  def create_datasets(self):
-    train, val, test = np.split(self.raw_data.sample(frac=1), [int(0.8*len(self.raw_data)), int(0.9*len(self.raw_data))])
-    # datasets = [self.__create_dataset(item) for item in splat]
+    numerical_features = ['hourOfDay', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'errbalanceOrig', 'errbalanceDest']
+    string_features = ['type']
 
-    self.datasets = {
-      'train': self.__create_dataset(train),
-      'val': self.__create_dataset(val),
-      'test': self.__create_dataset(test)
-    }
-
-  def preprocess_data(self):
-    numerical_features = []
-    string_features = []
-
-    for col in self.raw_data.columns:
-      if (self.raw_data.dtypes[col] == "int64" or self.raw_data.dtypes[col] == "float64"):
-        numerical_features.append(col)
-      elif (self.raw_data.dtypes[col] == "string"):
-        string_features.append(col)
-
-    self.all_inputs = []
-    self.encoded_features = []
+    configs = {}
 
     # Numerical features.
-    for i,num_header in enumerate(numerical_features):
-      print(f'processing feature {num_header} ({i+1}/{len(numerical_features)})')
-      col = tf.keras.Input(shape=(1,), name=num_header)
-      num_layer = self.__normalization_layer(num_header, self.datasets['train'])
-      num_encoded_col = num_layer(col)
-      self.all_inputs.append(col)
-      self.encoded_features.append(num_encoded_col)
+    for header in numerical_features:
+      print(f'Processing column {header}')
+      col = keras.Input(shape=(1,), name=header)
+      layer = self.__create_numeric_layer(header, self.datasets['train'], configs)
+      all_inputs.append(col)
+      encoded_features.append(layer(col))
 
-    for i,str_header in enumerate(string_features):
-      print(f'processing feature {str_header} ({i+1}/{len(string_features)})')
-      col = tf.keras.Input(shape=(1,), name=str_header, dtype='string')
-      str_layer = self.__category_encoding_layer(name=str_header, dataset=self.datasets['train'], dtype='string', max_tokens=5)
-      str_encoded_col = str_layer(col)
-      self.all_inputs.append(col)
-      self.encoded_features.append(str_encoded_col)
+    # String features
+    for header in string_features:
+      print(f'Processing column {header}')
+      col = keras.Input(shape=(1,), name=header, dtype='string')
+      layer = self.__create_string_layer(header, self.datasets['train'], 'string', configs)
+      all_inputs.append(col)
+      encoded_features.append(layer(col))
 
-  def create_model(self):
-    x = tf.keras.layers.concatenate(self.encoded_features)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
-    # x = tf.keras.layers.Dropout(0.5)(x)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
-    # x = tf.keras.layers.Dropout(0.15)(x)
-    # x = tf.keras.layers.Dense(16, activation="relu")(x)
-    x = tf.keras.layers.Dropout(0.5)(x)
-    output = tf.keras.layers.Dense(1)(x)
+    self.configs = configs
+    self.all_inputs = all_inputs
+    self.encoded_features = encoded_features
 
-    model = tf.keras.Model(self.all_inputs, output)
+  def __create_model(self):
+    all_features = keras.layers.concatenate(self.encoded_features)
+    x = keras.layers.Dense(9, activation="relu")(all_features)
+    x = keras.layers.Dense(9, activation="relu")(x)
+    output = keras.layers.Dense(1, activation="relu")(x)
 
-    model.compile(optimizer='adam', loss=tf.keras.losses.BinaryCrossentropy(from_logits=True), metrics=["accuracy"])
-    return model
+    model = keras.Model(self.all_inputs, output)
 
-  def save_model(self, name, model):
-    model.save(f'models/{name}')
+    model.compile(optimizer='adam',
+                  loss=keras.losses.BinaryCrossentropy(from_logits=True),
+                  metrics=["accuracy"])
+
+    self.model = model
+
+  def __fit_model(self, epochs):
+    self.model.fit(self.datasets['train'], epochs=epochs, validation_data=self.datasets['val'])
+
+  def __save_model(self, ts, suffix):
+    self.model.save(f'{self.output}/{ts}{suffix}')
+
+  def __save_model_metadata(self, ts, accuracy, loss, epochs):
+    with open(f'{self.output}/{ts}_{epochs}/metadata.yaml', 'w') as stream:
+      yaml.dump({
+        'accuracy':float(accuracy),
+        'loss': float(loss),
+        'epochs': epochs,
+        'configs': self.configs
+      }, stream, sort_keys=False)
+
+  def run(self, times=1, epochs=10, save_each=True):
+    self.__split()
+    self.__create_datasets()
+    self.__preprocess_data()
+    self.__create_model()
+    count = 0
+
+    while count < times:
+      os.system('clear')
+      self.__fit_model(epochs)
+      count+=1
+      if save_each:
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+        self.__save_model(ts, f'_{count*epochs}')
+        loss, accuracy = self.model.evaluate(self.datasets['test'], verbose=0)
+        self.__save_model_metadata(ts, accuracy, loss, count*epochs)
+      elif count+1 == times:
+        ts = time.strftime("%Y_%m_%d-%H_%M_%S")
+        self.__save_model(ts, f'_{count*epochs}')
+        loss, accuracy = self.model.evaluate(self.datasets['test'])
+        self.__save_model_metadata(ts, accuracy, loss, count*epochs)
+
+class Predicter:
+  def __init__(self, model):
+    self.model = tf.keras.models.load_model(model)
   
-  def save_model_metadata(self, ts, accuracy, loss, epochs):
-    with open(f'models/{ts}-{epochs}/readme.txt', 'w') as f:
-        f.write(f'accuracy\t{accuracy}\n')
-        f.write(f'loss\t\t\t{loss}\n')
-        f.write(f'epochs\t\t{epochs}\n')
-
-  def load_model(self, name):
-    return tf.keras.models.load_model(f'models/{name}')
-
-  def run(self):
-    self.load_data()
-    self.create_datasets()
-    self.preprocess_data()
-    model = self.create_model()
-
-    epochs = 0
-    epoch_batch = 10
-
-    while epochs < 100:
-      model.fit(self.datasets['train'], epochs=epoch_batch, validation_data=self.datasets['val'])
-      epochs += epoch_batch
-      metrics = model.evaluate(self.datasets['test'])
-
-      ts = time.strftime("%Y_%m_%d-%H_%M_%S")
-      self.save_model(f'{ts}-{epochs}', model)
-      self.save_model_metadata(ts, metrics[1], metrics[0], epochs)
+  def predict(self, data):
+    pred = self.model.predict(data)
+    return tf.nn.sigmoid(pred[0])[0] * 100
+  
